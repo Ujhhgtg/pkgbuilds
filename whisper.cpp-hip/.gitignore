@@ -1,0 +1,39 @@
+# Build artifacts
+pkg/
+src/
+
+# Built packages
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.pkg.tar.gz
+*.pkg.tar.bz2
+*.pkg.tar
+
+# Downloaded sources (keep the PKGBUILD, ignore fetched tarballs/zips)
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+*.tar.zst
+*.zip
+*.7z
+*.gz
+*.bz2
+*.xz
+*.zst
+
+# But don't ignore local source patches/files you authored
+!*.patch
+!*.diff
+!*.install
+!*.desktop
+!*.service
+!*.conf
+
+# makepkg logs
+*.log
+
+# namcap output
+*.namcap
+
+# srcinfo (can be regenerated with `makepkg --printsrcinfo`)
+.SRCINFO

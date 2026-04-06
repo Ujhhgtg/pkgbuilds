@@ -1,0 +1,67 @@
+# Maintainer: Fey Xie <feyxiexzf@gmail.com>
+# Contributer: robertfoster
+
+pkgname=ggml-hipblas-git
+pkgver=r3625.49f84a9
+pkgrel=1
+pkgdesc="Tensor library for machine learning (with AMD ROCm optimizations)"
+arch=('armv7h' 'aarch64' 'x86_64')
+url="https://github.com/ggml-org/ggml"
+license=("MIT")
+depends=('hipblas')
+makedepends=(
+  'cmake'
+  'git'
+  'rocm-hip-sdk'
+)
+conflicts=("${pkgname%%-git}")
+provides=("${pkgname%%-git}")
+source=("${pkgname%%-git}::git+${url}")
+
+pkgver() {
+  cd "${srcdir}/${pkgname%%-git}"
+
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+  export HIP_PATH="/opt/rocm"
+  export CXXFLAGS+="$CXXFLAGS -fcf-protection=none"
+  export CC="/opt/rocm/llvm/bin/clang"
+  export CXX="/opt/rocm/llvm/bin/clang++"
+  export HIPCC="/opt/rocm/llvm/bin/clang"
+  export HIPCXX="/opt/rocm/llvm/bin/clang++"
+  export HIP_PLATFORM=amd
+
+  cmake \
+    -B "${srcdir}/build" \
+    -S "${srcdir}/${pkgname%%-git}" \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+    -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+    -DCMAKE_PREFIX_PATH="/opt/rocm" \
+    -DGGML_LTO=ON \
+    -DGGML_RPC=ON \
+    -DGGML_HIP=ON \
+    -DGGML_BUILD_SHARED=ON \
+    -DGGML_BUILD_EXAMPLES=OFF \
+    -DGGML_BUILD_TESTS=OFF \
+    -DGGML_HIPBLAS=ON \
+    -DGGML_HIP_GRAPHS=ON \
+    -DGGML_NATIVE=ON \
+    -DGGML_ROCM=1 \
+    -DGGML_CUDA_FA_ALL_QUANTS=ON \
+    -DHIP_PLATFORM=amd
+
+  cmake --build build
+}
+
+package() {
+  DESTDIR="${pkgdir}" cmake --install "${srcdir}/build"
+
+  install -Dm644 "${srcdir}/${pkgname%%-git}/LICENSE" \
+    -t "${pkgdir}/usr/share/licenses/${pkgname}"
+}
+
+sha256sums=('SKIP')
