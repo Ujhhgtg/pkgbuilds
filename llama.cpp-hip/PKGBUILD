@@ -19,6 +19,7 @@ depends=(
   openmp
   python
   rocblas
+  ggml-hip
 )
 makedepends=(
   cmake
