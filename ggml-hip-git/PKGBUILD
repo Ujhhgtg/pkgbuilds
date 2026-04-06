@@ -14,8 +14,8 @@ makedepends=(
   'git'
   'rocm-hip-sdk'
 )
-conflicts=("${pkgname%%-git}")
-provides=("${pkgname%%-git}")
+conflicts=("ggml" "libggml" "ggml-hip")
+provides=("ggml" "libggml" "ggml-hip")
 source=("${pkgname%%-git}::git+${url}")
 sha256sums=('SKIP')
 
