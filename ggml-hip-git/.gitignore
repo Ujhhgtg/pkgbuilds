@@ -1,6 +1,7 @@
 # Build artifacts
 pkg/
 src/
+ggml-hip/
 
 # Built packages
 *.pkg.tar.zst

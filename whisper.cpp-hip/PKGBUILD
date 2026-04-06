@@ -34,14 +34,14 @@ build() {
   export HIPCC="/opt/rocm/llvm/bin/clang"
   export HIPCXX="/opt/rocm/llvm/bin/clang++"
   export HIP_PLATFORM=amd
-  
+
   cmake \
     -B "${srcdir}/build" \
     -S "${srcdir}/${_pkgbase}-${pkgver}" \
     -DCMAKE_INSTALL_PREFIX=/usr \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang \
-    -DCMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++ \
+    -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+    -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
     -DCMAKE_PREFIX_PATH="/opt/rocm" \
     -DGGML_LTO=ON \
     -DGGML_RPC=ON \

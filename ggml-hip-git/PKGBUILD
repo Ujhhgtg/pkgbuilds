@@ -1,7 +1,7 @@
 # Maintainer: Fey Xie <feyxiexzf@gmail.com>
 # Contributer: robertfoster
 
-pkgname=ggml-hipblas-git
+pkgname=ggml-hip-git
 pkgver=r3625.49f84a9
 pkgrel=1
 pkgdesc="Tensor library for machine learning (with AMD ROCm optimizations)"
@@ -17,6 +17,7 @@ makedepends=(
 conflicts=("${pkgname%%-git}")
 provides=("${pkgname%%-git}")
 source=("${pkgname%%-git}::git+${url}")
+sha256sums=('SKIP')
 
 pkgver() {
   cd "${srcdir}/${pkgname%%-git}"
@@ -63,5 +64,3 @@ package() {
   install -Dm644 "${srcdir}/${pkgname%%-git}/LICENSE" \
     -t "${pkgdir}/usr/share/licenses/${pkgname}"
 }
-
-sha256sums=('SKIP')
