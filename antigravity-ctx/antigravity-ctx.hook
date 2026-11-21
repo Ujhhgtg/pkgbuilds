@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = antigravity
+Target = antigravity-ctx
+
+[Action]
+Description = Applying the configured Antigravity context cap
+When = PostTransaction
+Exec = /usr/bin/antigravity-ctx apply

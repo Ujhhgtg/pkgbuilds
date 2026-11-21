@@ -1,0 +1,366 @@
+#!/usr/bin/python -I
+
+import argparse
+from contextlib import contextmanager
+import io
+import mmap
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import struct
+import sys
+import tempfile
+import zipfile
+import zlib
+
+
+CONFIG = Path("/etc/antigravity-ctx.conf")
+SERVER = Path("/opt/Antigravity/resources/bin/language_server")
+STATS_SCRIPT = Path("/usr/share/antigravity-ctx/stats.js")
+ORIGINAL_CAP = 256_000
+CLAMP_ANCHOR = re.compile(
+    rb"\x8b\x54\x24\x4c\x81\xfa(?P<compare>.{4})\xbe(?P<load>.{4})"
+    rb"\x0f\x42\xf2\x89\x74\x24\x50\x8b\x54\x24\x5c\x85\xd2\x81\xfa\x00\x40\x00\x00",
+    re.DOTALL,
+)
+ZIP_END = struct.Struct("<4s4H2IH")
+RENDERER_FILES = {"main.js", "jetbox.css", "compiled_tailwind.css"}
+STATS_START = b"function antigravityCtxStats("
+STATS_RENDERER = b"function antigravityCtxRenderStats("
+JS_NAME = rb"[$A-Za-z_][$\w]*"
+FOOTER_ANCHOR = re.compile(
+    rb"\bfunction " + JS_NAME + rb"\(\{cancelInvocation:" + JS_NAME
+    + rb",\s*isRunning:[^{}()]{1,1500}?\bmodelSelector:(?P<model>" + JS_NAME + rb")"
+    + rb",[^{}()]{0,1500}?\bpermissionsSelector:(?P<permissions>" + JS_NAME + rb")"
+    + rb",\s*contextUsageIndicator:(?P<meter>" + JS_NAME + rb"),"
+)
+STATE_ANCHOR = re.compile(
+    rb"\(0,(?P<react>" + JS_NAME + rb")\.useContext\)\((?P<context>" + JS_NAME + rb")\)"
+    + rb"\?\.cascadeContext\.state\.agentStateProvider\?\?(?P<empty>" + JS_NAME + rb"),\s*"
+    + JS_NAME + rb"=(?P<hook>" + JS_NAME + rb")\(" + JS_NAME + rb"," + JS_NAME + rb"\);"
+)
+NATIVE_METER_ANCHOR = re.compile(
+    rb"(?<![$\w])(?P<component>" + JS_NAME + rb")=" + JS_NAME + rb"\?\.contextUsageIndicator\?\.Indicator,\s*"
+    + rb"(?P<default>" + JS_NAME + rb")=!!(?P=component)&&\(" + JS_NAME
+    + rb'\.get\("contextUsageIndicator"\)\?\?!1\),\s*(?P<enabled>' + JS_NAME + rb")="
+    + JS_NAME + rb'\("contextUsageIndicatorEnabled",(?P=default)\)===!0'
+)
+
+
+class UnsupportedBuild(ValueError):
+    pass
+
+
+def parse_cap(value):
+    if value == "off":
+        return None
+    match = re.fullmatch(r"([0-9]+)([kK]?)", value)
+    if match is None:
+        raise ValueError("use a token count such as 600000 or 600k, or off")
+    try:
+        cap = int(match[1]) * (1_000 if match[2] else 1)
+    except ValueError:
+        cap = 0
+    if not 1 <= cap <= 2_147_483_647:
+        raise ValueError("token count must be between 1 and 2147483647")
+    return cap
+
+
+def read_config():
+    settings = {}
+    for line in CONFIG.read_text().splitlines():
+        entry = line.partition("#")[0].strip()
+        if not entry:
+            continue
+        key, separator, value = map(str.strip, entry.partition("="))
+        if not separator or key not in {"cap", "stats"} or key in settings:
+            raise ValueError(f"invalid or duplicate setting in {CONFIG}: {entry}")
+        settings[key] = value
+    if "cap" not in settings:
+        raise ValueError(f"missing cap= setting in {CONFIG}")
+    settings.setdefault("stats", "off")
+    if settings["stats"] not in {"on", "off"}:
+        raise ValueError(f"stats in {CONFIG} must be on or off")
+    parse_cap(settings["cap"])
+    return settings
+
+
+@contextmanager
+def atomic_replacement(path):
+    with tempfile.NamedTemporaryFile(
+        mode="w+b", prefix=f".{path.name}.", dir=path.parent, delete=False
+    ) as staged:
+        staged_path = Path(staged.name)
+        try:
+            yield staged
+            staged.flush()
+            os.fsync(staged.fileno())
+            staged.close()
+            os.replace(staged_path, path)
+        finally:
+            staged_path.unlink(missing_ok=True)
+
+
+def save_config(settings):
+    with atomic_replacement(CONFIG) as staged:
+        staged.write(f"cap={settings['cap']}\nstats={settings['stats']}\n".encode("ascii"))
+        os.fchmod(staged.fileno(), 0o644)
+
+
+def executable_sections(contents):
+    if contents[:7] != b"\x7fELF\x02\x01\x01" or contents[18:20] != b"\x3e\x00":
+        raise UnsupportedBuild("expected a little-endian x86-64 ELF binary")
+
+    table_offset, = struct.unpack_from("<Q", contents, 40)
+    entry_size, entry_count = struct.unpack_from("<HH", contents, 58)
+    if entry_size != 64 or not entry_count or table_offset < 64:
+        raise UnsupportedBuild("no standard ELF section table")
+    if table_offset + entry_size * entry_count > len(contents):
+        raise UnsupportedBuild("truncated ELF section table")
+
+    for index in range(entry_count):
+        header = table_offset + index * entry_size
+        section_type, flags = struct.unpack_from("<IQ", contents, header + 4)
+        if section_type == 1 and flags & 0x6 == 0x6:
+            offset, size = struct.unpack_from("<QQ", contents, header + 24)
+            if offset + size > len(contents):
+                raise UnsupportedBuild("truncated executable ELF section")
+            yield offset, offset + size
+
+
+def read_clamp(binary):
+    if os.fstat(binary.fileno()).st_size < 64:
+        raise UnsupportedBuild("truncated ELF header")
+
+    with mmap.mmap(binary.fileno(), 0, access=mmap.ACCESS_READ) as contents:
+        match = None
+        for start, end in executable_sections(contents):
+            for candidate in CLAMP_ANCHOR.finditer(contents, start, end):
+                if match is not None:
+                    raise UnsupportedBuild("multiple checkpoint clamp anchors matched")
+                match = candidate
+        if match is None:
+            raise UnsupportedBuild("checkpoint clamp anchor was not found")
+
+        cap, = struct.unpack("<i", match["compare"])
+        if cap <= 0 or match["compare"] != match["load"]:
+            raise UnsupportedBuild("checkpoint clamp immediates disagree or are invalid")
+        return (match.start("compare"), match.start("load")), cap
+
+
+def find_renderer_archive(contents):
+    found = None
+    archive_end = contents.find(b"PK\x05\x06")
+    while archive_end >= 0 and archive_end + ZIP_END.size <= len(contents):
+        _, disk, central_disk, entries, total, size, offset, comment_size = ZIP_END.unpack_from(contents, archive_end)
+        central = archive_end - size
+        start = central - offset
+        stop = archive_end + ZIP_END.size + comment_size
+        if (disk == central_disk == 0 and entries == total and entries > 0
+                and 0 <= start < central < archive_end and stop <= len(contents)
+                and contents[start:start + 4] == b"PK\x03\x04" and contents[central:central + 4] == b"PK\x01\x02"):
+            data = contents[start:stop]
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    names = archive.namelist()
+                    if all(names.count(name) == 1 for name in RENDERER_FILES):
+                        if found is not None:
+                            raise UnsupportedBuild("multiple renderer archives matched")
+                        found = (start, data)
+            except zipfile.BadZipFile:
+                pass
+        archive_end = contents.find(b"PK\x05\x06", archive_end + 1)
+    return found
+
+
+def find_anchor(script, pattern, description):
+    matches = re.finditer(pattern, script)
+    match = next(matches, None)
+    if match is None or next(matches, None) is not None:
+        raise UnsupportedBuild(f"composer stats {description} anchor is missing or ambiguous")
+    return match
+
+
+def composer_stats_edits(script, footer, react, patched, enabled):
+    model, permissions, meter = footer.group("model", "permissions", "meter")
+    picker_meter = model + b"&&" + meter + b","
+    picker = find_anchor(
+        script, rb'"flex items-center gap-1 min-w-0"\},\s*(?P<left>(?:' + re.escape(picker_meter)
+        + rb")?)" + re.escape(model) + rb",(?P<right>(?:" + re.escape(picker_meter) + rb")?)"
+        + re.escape(react) + rb"\.createElement\(" + JS_NAME + rb",\{agent:", "model picker row",
+    )
+    if bool(picker["left"]) + bool(picker["right"]) != int(patched):
+        raise UnsupportedBuild("composer stats placement does not match patch state")
+
+    send_meter = meter + b","
+    send = find_anchor(
+        script, rb'"shrink-0 flex items-center gap-0\.5"\},\s*' + re.escape(permissions)
+        + rb",(?P<slot>" + (b"" if patched else re.escape(send_meter)) + rb")" + re.escape(react)
+        + rb"\.createElement\(" + JS_NAME + rb",\{isRunning:", "send button row",
+    )
+
+    native = find_anchor(script, NATIVE_METER_ANCHOR, "native indicator")
+    component, native_enabled = native.group("component", "enabled")
+    native_prefix = component + b"&&" + native_enabled + b"&&"
+    native_element = b"?" + react + b".createElement(" + component + b",{conversationId:"
+    patched_element = b"?" + react + b".createElement(antigravityCtxStats,{key:"
+    mount = find_anchor(
+        script, rb"contextUsageIndicator:(?P<slot>" + (b"" if patched else re.escape(native_prefix))
+        + rb"(?P<conversation>" + JS_NAME + rb")" + re.escape(patched_element if patched else native_element)
+        + rb"(?P=conversation)\}\):void 0),\s*slashCommandItems:", "indicator mount",
+    )
+    conversation = mount["conversation"]
+    expression = conversation + patched_element if enabled else native_prefix + conversation + native_element
+    return [
+        (*picker.span("left"), b""),
+        (*picker.span("right"), picker_meter if enabled else b""),
+        (*send.span("slot"), b"" if enabled else send_meter),
+        (*mount.span("slot"), expression + conversation + b"}):void 0"),
+    ]
+
+
+def renderer_script(script, enabled):
+    patched = STATS_START in script
+    if not enabled and not patched:
+        return script
+
+    footer = find_anchor(script, FOOTER_ANCHOR, "footer")
+    state = find_anchor(script, STATE_ANCHOR, "state provider")
+    react = state["react"]
+    tooltip = find_anchor(
+        script, rb"\b(?:var|const) (?P<tooltip>" + JS_NAME + rb")=" + re.escape(react)
+        + rb"\.memo\(\(\{id:" + JS_NAME + rb",content:" + JS_NAME + rb",children:" + JS_NAME + rb",place:",
+        "tooltip",
+    )["tooltip"]
+    start = footer.start()
+    if patched:
+        if script.count(STATS_START) != 1:
+            raise UnsupportedBuild("existing composer stats patch is ambiguous")
+        start = script.index(STATS_START)
+        if start >= footer.start():
+            raise UnsupportedBuild("existing composer stats patch is misplaced")
+
+    component = b""
+    if enabled:
+        component = STATS_SCRIPT.read_bytes()
+        if not component.startswith(STATS_RENDERER) or STATS_START in component:
+            raise ValueError("invalid packaged stats.js component")
+        bindings = b",".join((*state.group("react", "context", "hook", "empty"), tooltip))
+        component = STATS_START + b"){return antigravityCtxRenderStats(" + bindings + b");}\n" + component
+
+    edits = composer_stats_edits(script, footer, react, patched, enabled)
+    edits.append((start, footer.start(), component))
+    for begin, end, replacement in sorted(edits, reverse=True):
+        script = script[:begin] + replacement + script[end:]
+    return script
+
+
+def plan_renderer_patch(binary, enabled):
+    with mmap.mmap(binary.fileno(), 0, access=mmap.ACCESS_READ) as contents:
+        found = find_renderer_archive(contents)
+    if found is None:
+        if enabled:
+            raise UnsupportedBuild("embedded renderer archive was not found")
+        return None
+
+    offset, blob = found
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+            main = archive.read("main.js")
+            patched = renderer_script(main, enabled)
+            if patched == main:
+                return None
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w") as replacement:
+                for entry in archive.infolist():
+                    replacement.writestr(entry, patched if entry.filename == "main.js" else archive.read(entry), compresslevel=9)
+        result = output.getvalue()
+        padding = len(blob) - len(result)
+        if not 0 <= padding <= 65535:
+            raise UnsupportedBuild("patched renderer archive cannot fit in its original space")
+        result = result[:-2] + struct.pack("<H", padding) + bytes(padding)
+        with zipfile.ZipFile(io.BytesIO(result)) as check:
+            if check.read("main.js") != patched:
+                raise ValueError("patched renderer failed verification")
+    except (zipfile.BadZipFile, NotImplementedError, zlib.error) as error:
+        raise UnsupportedBuild(f"invalid renderer archive: {error}") from error
+    return offset, result
+
+
+def apply_settings(configured_cap, stats_enabled):
+    new_cap = ORIGINAL_CAP if configured_cap is None else configured_cap
+    path = SERVER.resolve(strict=True)
+    if not stat.S_ISREG(path.stat().st_mode):
+        raise ValueError(f"expected a regular file at {path}")
+
+    with path.open("rb") as source:
+        try:
+            offsets, current_cap = read_clamp(source)
+            renderer = plan_renderer_patch(source, stats_enabled)
+        except UnsupportedBuild as error:
+            print(f"antigravity-ctx: skipping unrecognized server build ({error})", file=sys.stderr)
+            return
+
+        if current_cap == new_cap and renderer is None:
+            print(f"Antigravity settings already applied (cap: {new_cap:,}; stats: {'on' if stats_enabled else 'off'}).")
+            return
+
+        source_stat = os.fstat(source.fileno())
+        with atomic_replacement(path) as staged:
+            shutil.copyfileobj(source, staged, length=1024 * 1024)
+            immediate = struct.pack("<i", new_cap)
+            for offset in offsets:
+                staged.seek(offset)
+                staged.write(immediate)
+            if renderer is not None:
+                offset, archive = renderer
+                staged.seek(offset)
+                staged.write(archive)
+            staged.flush()
+            if read_clamp(staged) != (offsets, new_cap):
+                raise ValueError("staged binary has the wrong clamp location or cap")
+
+            staged_stat = os.fstat(staged.fileno())
+            owner = (source_stat.st_uid, source_stat.st_gid)
+            if owner != (staged_stat.st_uid, staged_stat.st_gid):
+                os.fchown(staged.fileno(), *owner)
+            shutil.copystat(path, staged.name)
+
+    if current_cap != new_cap:
+        print(f"Antigravity context cap changed from {current_cap:,} to {new_cap:,} tokens.")
+    if renderer is not None:
+        print(f"Antigravity context stats {'enabled' if stats_enabled else 'disabled'}.")
+    print("Restart Antigravity to load the changes.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Configure Antigravity Desktop's context cap and composer meter.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("apply", help=f"apply the setting in {CONFIG}")
+    cap_command = commands.add_parser("cap", help="save and apply a new context cap")
+    cap_command.add_argument("cap", help="token count, such as 600k, or off to restore the stock cap")
+    stats_command = commands.add_parser("stats", help="save and apply the composer context indicator setting")
+    stats_command.add_argument("value", choices=("on", "off"))
+    args = parser.parse_args()
+
+    try:
+        settings = read_config()
+        if args.command == "cap":
+            try:
+                parse_cap(args.cap)
+            except ValueError as error:
+                cap_command.error(str(error))
+            settings["cap"] = args.cap.lower()
+            save_config(settings)
+        elif args.command == "stats":
+            settings["stats"] = args.value
+            save_config(settings)
+        apply_settings(parse_cap(settings["cap"]), settings["stats"] == "on")
+    except (OSError, ValueError) as error:
+        parser.exit(1, f"antigravity-ctx: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
