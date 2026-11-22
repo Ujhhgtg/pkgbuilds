@@ -2,7 +2,7 @@
 # Contributer: robertfoster
 
 pkgname=ggml-hip-git
-pkgver=r3625.49f84a9
+pkgver=r4091.eced84c
 pkgrel=1
 pkgdesc="Tensor library for machine learning (with AMD ROCm optimizations)"
 arch=('armv7h' 'aarch64' 'x86_64')
