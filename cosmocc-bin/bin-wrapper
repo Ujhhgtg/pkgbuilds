@@ -1,2 +1,0 @@
-#!/bin/bash
-exec "/opt/cosmocc/bin/$(basename "${BASH_SOURCE[0]}")" "$@"
