@@ -1,0 +1,37 @@
+pkgname=antigravity-extras
+pkgver=0.3.0
+pkgrel=2
+pkgdesc='Context cap, composer meter, and account switching for Antigravity Desktop'
+arch=('x86_64')
+url='https://github.com/Ujhhgtg/pkgbuilds/tree/master/antigravity-extras'
+license=('MIT')
+depends=('antigravity' 'python')
+optdepends=('python-gobject: switch saved Google accounts through the desktop keyring')
+provides=("antigravity-ctx=$pkgver")
+conflicts=('antigravity-ctx')
+replaces=('antigravity-ctx')
+backup=("etc/$pkgname.conf")
+install="$pkgname.install"
+source=("$pkgname" "$pkgname.conf" "$pkgname.hook" "$pkgname-restore.hook" 'README.md' 'stats.js' 'LICENSE'
+        'accounts.js' 'account-host.js' 'account-keyring.py' 'account-patch.py')
+sha256sums=('b69cd8db130c340fc10e2117f3d7737ce35520ebe76bc64af36538024be6a7fb'
+            'b4243d6c2e2bb8e44746ac123f5cacc544c1862d0a1b07420ceb43d7bd847e6b'
+            'c884f9d7dbf6fcca0fe84ae898619ff4f5ba049cab38e605a1b417042af962f2'
+            '354cf87aa66f3be96e84996ca867e769490d794ef398354547e0c796df8911fc'
+            'c92860abfd8fc3ce7a08bf5531616d8356f7638967a670ac6505e4af6ade0d0e'
+            '98ec3c274467618cee1217f319d04e50324f4b404fdef9283d5a447a1f41b92e'
+            'b7962200bd4cf6f593e38a58bc0f730804e7cf632875f64ae1344e75cc0e4ca3'
+            '4590bc0b65cfd634329d6880b8a2507cc61fa6c44230c4dcece3bd17c6cb1c66'
+            '5cbcb1f0335a4073a37c463c1df24eafe3395bf843f7a385abd190593b034bc3'
+            '5fc98101c30f8fdc37fbe68b9d6af2e7c6f18daffd7875bdb54a957bd3c3d0db'
+            '40d45f36ed20bca93966ec4b91b496bc7ff99e4edb87621a8a0193e9c082c611')
+
+package() {
+    install -Dm755 "${srcdir}/$pkgname" "${pkgdir}/usr/bin/$pkgname"
+    install -Dm644 "${srcdir}/$pkgname.conf" "${pkgdir}/etc/$pkgname.conf"
+    install -Dm644 "${srcdir}/$pkgname.hook" "${pkgdir}/usr/share/libalpm/hooks/$pkgname.hook"
+    install -Dm644 "${srcdir}/$pkgname-restore.hook" "${pkgdir}/usr/share/libalpm/hooks/$pkgname-restore.hook"
+    install -Dm644 "${srcdir}/README.md" "${pkgdir}/usr/share/doc/$pkgname/README.md"
+    install -Dm644 -t "${pkgdir}/usr/share/$pkgname" "${srcdir}/"{"$pkgname.conf",stats.js,accounts.js,account-host.js,account-keyring.py,account-patch.py}
+    install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

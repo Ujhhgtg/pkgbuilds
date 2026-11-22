@@ -1,12 +1,11 @@
 #!/usr/bin/python -I
 
 import argparse
-from contextlib import contextmanager
 import io
 import mmap
 import os
-from pathlib import Path
 import re
+import runpy
 import shutil
 import stat
 import struct
@@ -14,11 +13,14 @@ import sys
 import tempfile
 import zipfile
 import zlib
+from contextlib import ExitStack, contextmanager
+from pathlib import Path
 
-
-CONFIG = Path("/etc/antigravity-ctx.conf")
+CONFIG = Path("/etc/antigravity-extras.conf")
 SERVER = Path("/opt/Antigravity/resources/bin/language_server")
-STATS_SCRIPT = Path("/usr/share/antigravity-ctx/stats.js")
+STATS_SCRIPT = Path("/usr/share/antigravity-extras/stats.js")
+ASAR = SERVER.parent.parent / "app.asar"
+ACCOUNT_RESOURCES = STATS_SCRIPT.parent
 ORIGINAL_CAP = 256_000
 ORIGINAL_PROFILE_CAP = 512_000
 CLAMP_ANCHOR = re.compile(
@@ -95,14 +97,16 @@ def read_config():
         if not entry:
             continue
         key, separator, value = map(str.strip, entry.partition("="))
-        if not separator or key not in {"cap", "stats"} or key in settings:
+        if not separator or key not in {"cap", "stats", "accounts"} or key in settings:
             raise ValueError(f"invalid or duplicate setting in {CONFIG}: {entry}")
         settings[key] = value
     if "cap" not in settings:
         raise ValueError(f"missing cap= setting in {CONFIG}")
     settings.setdefault("stats", "off")
-    if settings["stats"] not in {"on", "off"}:
-        raise ValueError(f"stats in {CONFIG} must be on or off")
+    settings.setdefault("accounts", "off")
+    for toggle in ("stats", "accounts"):
+        if settings[toggle] not in {"on", "off"}:
+            raise ValueError(f"{toggle} in {CONFIG} must be on or off")
     parse_cap(settings["cap"])
     return settings
 
@@ -125,7 +129,7 @@ def atomic_replacement(path):
 
 def save_config(settings):
     with atomic_replacement(CONFIG) as staged:
-        staged.write(f"cap={settings['cap']}\nstats={settings['stats']}\n".encode("ascii"))
+        staged.write("".join(f"{key}={settings[key]}\n" for key in ("cap", "stats", "accounts")).encode("ascii"))
         os.fchmod(staged.fileno(), 0o644)
 
 
@@ -150,7 +154,7 @@ def executable_sections(contents):
             yield offset, offset + size
 
 
-def read_clamp(binary):
+def read_clamp(binary, *, required=True):
     if os.fstat(binary.fileno()).st_size < 64:
         raise UnsupportedBuild("truncated ELF header")
 
@@ -162,6 +166,8 @@ def read_clamp(binary):
                     raise UnsupportedBuild("multiple checkpoint clamp anchors matched")
                 match = candidate
         if match is None:
+            if not required:
+                return None
             raise UnsupportedBuild("checkpoint clamp anchor was not found")
 
         cap, = struct.unpack("<i", match["compare"])
@@ -310,108 +316,152 @@ def renderer_script(script, enabled):
     return script
 
 
-def plan_renderer_patch(binary, enabled):
+def repack_renderer(blob, script):
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive, zipfile.ZipFile(output, "w") as replacement:
+        for entry in archive.infolist():
+            data = script if entry.filename == "main.js" else archive.read(entry)
+            replacement.writestr(entry, data, compresslevel=9)
+    result = output.getvalue()
+    padding = len(blob) - len(result)
+    if not 0 <= padding <= 65535:
+        raise UnsupportedBuild("patched renderer archive cannot fit in its original space")
+    return result[:-2] + struct.pack("<H", padding) + bytes(padding)
+
+
+def plan_renderer_patches(binary, stats_enabled, accounts_enabled, attempt):
     with mmap.mmap(binary.fileno(), 0, access=mmap.ACCESS_READ) as contents:
         found = find_renderer_archive(contents)
     if found is None:
-        if enabled:
+        if stats_enabled or accounts_enabled:
             raise UnsupportedBuild("embedded renderer archive was not found")
-        return None
+        _, host = attempt("account switching", lambda: plan_account_patches(None, False)) or (None, None)
+        return None, host
 
     offset, blob = found
-    try:
-        with zipfile.ZipFile(io.BytesIO(blob)) as archive:
-            main = archive.read("main.js")
-            patched = renderer_script(main, enabled)
-            if patched == main:
-                return None
-            output = io.BytesIO()
-            with zipfile.ZipFile(output, "w") as replacement:
-                for entry in archive.infolist():
-                    replacement.writestr(entry, patched if entry.filename == "main.js" else archive.read(entry), compresslevel=9)
-        result = output.getvalue()
-        padding = len(blob) - len(result)
-        if not 0 <= padding <= 65535:
-            raise UnsupportedBuild("patched renderer archive cannot fit in its original space")
-        result = result[:-2] + struct.pack("<H", padding) + bytes(padding)
-        with zipfile.ZipFile(io.BytesIO(result)) as check:
-            if check.read("main.js") != patched:
+    with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+        main = archive.read("main.js")
+
+    def pack(script):
+        if script == main:
+            return None
+        packed = repack_renderer(blob, script)
+        with zipfile.ZipFile(io.BytesIO(packed)) as check:
+            if check.read("main.js") != script:
                 raise ValueError("patched renderer failed verification")
-    except (zipfile.BadZipFile, NotImplementedError, zlib.error) as error:
-        raise UnsupportedBuild(f"invalid renderer archive: {error}") from error
-    return offset, result
+        return offset, packed
+
+    def plan_stats():
+        script = renderer_script(main, stats_enabled)
+        return script, pack(script)
+
+    script, renderer = attempt("context meter", plan_stats) or (main, None)
+
+    def plan_accounts():
+        updated, host = plan_account_patches(script, accounts_enabled)
+        return (renderer if updated == script else pack(updated)), host
+
+    return attempt("account switching", plan_accounts) or (renderer, None)
 
 
-def apply_settings(configured_cap, stats_enabled):
-    new_cap = ORIGINAL_CAP if configured_cap is None else configured_cap
-    path = SERVER.resolve(strict=True)
-    if not stat.S_ISREG(path.stat().st_mode):
-        raise ValueError(f"expected a regular file at {path}")
+def plan_account_patches(script, enabled):
+    marker = b"antigravity-ctx accounts start"
+    source = ASAR.read_bytes() if enabled or ASAR.exists() else None
+    if not enabled and (source is None or marker not in source) and (script is None or marker not in script):
+        return script, None
+    patches = runpy.run_path(str(ACCOUNT_RESOURCES / "account-patch.py"))
+    host = (ACCOUNT_RESOURCES / "account-host.js").read_bytes() if enabled else None
+    ui = (ACCOUNT_RESOURCES / "accounts.js").read_bytes() if enabled else None
+    updated = patches["patch_asar"](source, host) if source is not None else None
+    renderer = patches["patch_renderer"](script, ui) if script is not None else None
+    return renderer, updated if updated != source else None
 
-    with path.open("rb") as source:
+
+def preserve_metadata(path, staged, source_stat):
+    staged_stat = os.fstat(staged.fileno())
+    owner = (source_stat.st_uid, source_stat.st_gid)
+    if owner != (staged_stat.st_uid, staged_stat.st_gid):
+        os.fchown(staged.fileno(), *owner)
+    shutil.copystat(path, staged.name)
+
+
+def apply_settings(configured_cap, stats_enabled, accounts_enabled=False, *, restoring=False):
+    failures = []
+
+    def attempt(feature, plan):
         try:
-            offsets, current_cap = read_clamp(source)
-            profiles = plan_profile_limits(source, configured_cap)
-            runtime_profile = plan_runtime_profile_limit(source, configured_cap)
-            renderer = plan_renderer_patch(source, stats_enabled)
-        except UnsupportedBuild as error:
-            print(f"antigravity-ctx: skipping unrecognized server build ({error})", file=sys.stderr)
-            return
+            return plan()
+        except (OSError, ValueError, KeyError, struct.error, zipfile.BadZipFile, NotImplementedError, zlib.error) as error:
+            failures.append(feature)
+            print(f"antigravity-extras: skipping {feature} ({error})", file=sys.stderr)
+            return None
 
-        if current_cap == new_cap and not profiles and not runtime_profile and renderer is None:
-            print(f"Antigravity settings already applied (cap: {new_cap:,}; stats: {'on' if stats_enabled else 'off'}).")
-            return
-
-        source_stat = os.fstat(source.fileno())
-        with atomic_replacement(path) as staged:
-            shutil.copyfileobj(source, staged, length=1024 * 1024)
-            immediate = struct.pack("<i", new_cap)
-            for offset in offsets:
-                staged.seek(offset)
-                staged.write(immediate)
-            for offset, limit in profiles + runtime_profile:
-                staged.seek(offset)
-                staged.write(limit)
+    new_cap = ORIGINAL_CAP if configured_cap is None else configured_cap
+    with ExitStack() as files:
+        source = None
+        if SERVER.exists() or not restoring:
+            path = SERVER.resolve(strict=True)
+            if not stat.S_ISREG(path.stat().st_mode):
+                raise ValueError(f"expected a regular file at {path}")
+            source = files.enter_context(path.open("rb"))
+        edits = []
+        if source is not None:
+            clamp = attempt("context cap", lambda: read_clamp(source, required=configured_cap is not None))
+            if clamp is not None:
+                offsets, current_cap = clamp
+                if current_cap != new_cap:
+                    edits.extend((offset, struct.pack("<i", new_cap)) for offset in offsets)
+            if clamp is not None or configured_cap is None:
+                edits.extend(attempt("bundled context caps", lambda: plan_profile_limits(source, configured_cap)) or [])
+                edits.extend(attempt("runtime context cap", lambda: plan_runtime_profile_limit(source, configured_cap)) or [])
+            renderer, asar_patch = attempt("renderer patches", lambda: plan_renderer_patches(
+                source, stats_enabled, accounts_enabled, attempt)) or (None, None)
             if renderer is not None:
-                offset, archive = renderer
-                staged.seek(offset)
-                staged.write(archive)
-            staged.flush()
-            if read_clamp(staged) != (offsets, new_cap):
-                raise ValueError("staged binary has the wrong clamp location or cap")
-            for offset, limit in profiles + runtime_profile:
-                staged.seek(offset)
-                if staged.read(len(limit)) != limit:
-                    raise ValueError("staged binary has the wrong model-profile limit")
+                edits.append(renderer)
+        else:
+            _, asar_patch = attempt("account switching", lambda: plan_account_patches(None, False)) or (None, None)
 
-            staged_stat = os.fstat(staged.fileno())
-            owner = (source_stat.st_uid, source_stat.st_gid)
-            if owner != (staged_stat.st_uid, staged_stat.st_gid):
-                os.fchown(staged.fileno(), *owner)
-            shutil.copystat(path, staged.name)
+        with ExitStack() as replacements:
+            if edits:
+                staged = replacements.enter_context(atomic_replacement(path))
+                shutil.copyfileobj(source, staged, length=1024 * 1024)
+                for offset, data in edits:
+                    staged.seek(offset)
+                    staged.write(data)
+                staged.flush()
+                if clamp is not None and read_clamp(staged) != (offsets, new_cap):
+                    raise ValueError("staged binary has the wrong clamp location or cap")
+                preserve_metadata(path, staged, os.fstat(source.fileno()))
+            if asar_patch is not None:
+                host = replacements.enter_context(atomic_replacement(ASAR))
+                host.write(asar_patch)
+                preserve_metadata(ASAR, host, ASAR.stat())
 
-    if current_cap != new_cap:
-        print(f"Antigravity context cap changed from {current_cap:,} to {new_cap:,} tokens.")
-    if profiles:
-        print(f"{'Restored' if configured_cap is None else 'Updated'} {len(profiles)} bundled 512K model-profile overrides.")
-    if runtime_profile:
-        print(f"{'Restored' if configured_cap is None else 'Updated'} the runtime 512K checkpoint limit.")
-    if renderer is not None:
-        print(f"Antigravity context stats {'enabled' if stats_enabled else 'disabled'}.")
-    print("Restart Antigravity to load the changes.")
+    if edits or asar_patch is not None:
+        print("Updated Antigravity patches. Restart Antigravity to load the changes.")
+    elif not failures:
+        print("Antigravity patches already match the requested settings.")
+    if restoring and failures:
+        raise ValueError("could not restore all patches; reinstall stock Antigravity before removing antigravity-extras")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Configure Antigravity Desktop's context cap and composer meter.")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("apply", help=f"apply the setting in {CONFIG}")
+    commands.add_parser("restore", help="undo all patches without changing saved settings")
     cap_command = commands.add_parser("cap", help="save and apply a new context cap")
     cap_command.add_argument("cap", help="token count, such as 600k, or off to restore the stock cap")
     stats_command = commands.add_parser("stats", help="save and apply the composer context indicator setting")
     stats_command.add_argument("value", choices=("on", "off"))
+    accounts_command = commands.add_parser("accounts", help="enable or disable in-place account switching")
+    accounts_command.add_argument("value", choices=("on", "off"))
     args = parser.parse_args()
 
     try:
+        if args.command == "restore":
+            apply_settings(None, False, restoring=True)
+            return
         settings = read_config()
         if args.command == "cap":
             try:
@@ -420,12 +470,12 @@ def main():
                 cap_command.error(str(error))
             settings["cap"] = args.cap.lower()
             save_config(settings)
-        elif args.command == "stats":
-            settings["stats"] = args.value
+        elif args.command in {"stats", "accounts"}:
+            settings[args.command] = args.value
             save_config(settings)
-        apply_settings(parse_cap(settings["cap"]), settings["stats"] == "on")
+        apply_settings(parse_cap(settings["cap"]), settings["stats"] == "on", settings["accounts"] == "on")
     except (OSError, ValueError) as error:
-        parser.exit(1, f"antigravity-ctx: {error}\n")
+        parser.exit(1, f"antigravity-extras: {error}\n")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Remove
+Type = Package
+Target = antigravity-extras
+
+[Action]
+Description = Restoring Antigravity before removing antigravity-extras
+When = PreTransaction
+Exec = /usr/bin/antigravity-extras restore
+AbortOnFail

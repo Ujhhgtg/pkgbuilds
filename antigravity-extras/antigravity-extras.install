@@ -1,0 +1,12 @@
+post_install() {
+    local config=/etc/antigravity-extras.conf
+    local defaults=/usr/share/antigravity-extras/antigravity-extras.conf
+    local previous
+    cmp -s "$config" "$defaults" || return 0
+    for previous in /etc/antigravity-ctx.conf /etc/antigravity-ctx.conf.pacsave; do
+        if [[ -f "$previous" ]]; then
+            install -m644 "$previous" "$config"
+            return
+        fi
+    done
+}
