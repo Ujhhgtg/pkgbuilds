@@ -20,9 +20,29 @@ CONFIG = Path("/etc/antigravity-ctx.conf")
 SERVER = Path("/opt/Antigravity/resources/bin/language_server")
 STATS_SCRIPT = Path("/usr/share/antigravity-ctx/stats.js")
 ORIGINAL_CAP = 256_000
+ORIGINAL_PROFILE_CAP = 512_000
 CLAMP_ANCHOR = re.compile(
     rb"\x8b\x54\x24\x4c\x81\xfa(?P<compare>.{4})\xbe(?P<load>.{4})"
     rb"\x0f\x42\xf2\x89\x74\x24\x50\x8b\x54\x24\x5c\x85\xd2\x81\xfa\x00\x40\x00\x00",
+    re.DOTALL,
+)
+STOCK_PROFILE_LIMIT = rb'\"max_token_limit\": \"512000\"'
+PROFILE_LIMIT_ANCHOR = re.compile(
+    rb'(?m)^    "MODEL_[A-Z0-9_]+": \{\r?\n'
+    rb'      "CASCADE_USE_EXPERIMENT_CHECKPOINTER": "\{\\n    \\"strategy\\": \\"CHECKPOINT_STRATEGY_SAME_MODEL\\",\\n    '
+    rb'(?P<field>' + re.escape(STOCK_PROFILE_LIMIT)
+    + rb'|\\"max_token_limit\\":[1-9][0-9]{0,9} {1,10}),\\n    \\"token_threshold\\":'
+)
+RUNTIME_PROFILE_STOCK = bytes.fromhex(
+    "83 79 0c 00 75 1f 48 63 57 14 0f 1f 40 00 48 81 fa 40 9c 00 00 "
+    "7f 04 31 d2 eb 07 48 81 c2 c0 63 ff ff 89 51 0c"
+)
+RUNTIME_PROFILE_PREFIX = bytes.fromhex("8b 51 0c 81 fa 00 d0 07 00 75 05 ba")
+RUNTIME_PROFILE_SUFFIX = bytes.fromhex("85 d2 75 0d 8b 57 14 81 ea 40 9c 00 00 7f 02 31 d2 89 51 0c 90")
+RUNTIME_PROFILE_ANCHOR = re.compile(
+    rb"\x48\x85\xff\x0f\x84.{4}(?P<limit>" + re.escape(RUNTIME_PROFILE_STOCK)
+    + b"|" + re.escape(RUNTIME_PROFILE_PREFIX) + b".{4}" + re.escape(RUNTIME_PROFILE_SUFFIX)
+    + rb")\x8b\x57\x14\x85\xd2\x7e\x16\x41\x89\xd0\x29\xf2\x44\x39\xc6",
     re.DOTALL,
 )
 ZIP_END = struct.Struct("<4s4H2IH")
@@ -44,7 +64,7 @@ STATE_ANCHOR = re.compile(
 NATIVE_METER_ANCHOR = re.compile(
     rb"(?<![$\w])(?P<component>" + JS_NAME + rb")=" + JS_NAME + rb"\?\.contextUsageIndicator\?\.Indicator,\s*"
     + rb"(?P<default>" + JS_NAME + rb")=!!(?P=component)&&\(" + JS_NAME
-    + rb'\.get\("contextUsageIndicator"\)\?\?!1\),\s*(?P<enabled>' + JS_NAME + rb")="
+    + rb'\.get\("contextUsageIndicator"\)\?\?\s*!1\),\s*(?P<enabled>' + JS_NAME + rb")="
     + JS_NAME + rb'\("contextUsageIndicatorEnabled",(?P=default)\)===!0'
 )
 
@@ -148,6 +168,39 @@ def read_clamp(binary):
         if cap <= 0 or match["compare"] != match["load"]:
             raise UnsupportedBuild("checkpoint clamp immediates disagree or are invalid")
         return (match.start("compare"), match.start("load")), cap
+
+
+def plan_profile_limits(binary, configured_cap):
+    replacement = STOCK_PROFILE_LIMIT
+    if configured_cap is not None and configured_cap != ORIGINAL_PROFILE_CAP:
+        replacement = (rb'\"max_token_limit\":' + str(configured_cap).encode("ascii")).ljust(len(STOCK_PROFILE_LIMIT))
+
+    with mmap.mmap(binary.fileno(), 0, access=mmap.ACCESS_READ) as contents:
+        edits = []
+        for match in PROFILE_LIMIT_ANCHOR.finditer(contents):
+            field = match["field"]
+            if len(field) != len(STOCK_PROFILE_LIMIT):
+                continue
+            if field != replacement:
+                edits.append((match.start("field"), replacement))
+        return edits
+
+
+def plan_runtime_profile_limit(binary, configured_cap):
+    with mmap.mmap(binary.fileno(), 0, access=mmap.ACCESS_READ) as contents:
+        matches = [match for start, end in executable_sections(contents)
+                   for match in RUNTIME_PROFILE_ANCHOR.finditer(contents, start, end)]
+        if len(matches) > 1:
+            raise UnsupportedBuild("multiple runtime checkpoint profile anchors matched")
+        if not matches:
+            return []
+        match = matches[0]
+        replacement = RUNTIME_PROFILE_STOCK
+        if configured_cap is not None and configured_cap != ORIGINAL_PROFILE_CAP:
+            replacement = RUNTIME_PROFILE_PREFIX + struct.pack("<i", configured_cap) + RUNTIME_PROFILE_SUFFIX
+        if len(replacement) != len(match["limit"]):
+            raise ValueError("runtime checkpoint profile patch changes instruction block size")
+        return [] if replacement == match["limit"] else [(match.start("limit"), replacement)]
 
 
 def find_renderer_archive(contents):
@@ -298,12 +351,14 @@ def apply_settings(configured_cap, stats_enabled):
     with path.open("rb") as source:
         try:
             offsets, current_cap = read_clamp(source)
+            profiles = plan_profile_limits(source, configured_cap)
+            runtime_profile = plan_runtime_profile_limit(source, configured_cap)
             renderer = plan_renderer_patch(source, stats_enabled)
         except UnsupportedBuild as error:
             print(f"antigravity-ctx: skipping unrecognized server build ({error})", file=sys.stderr)
             return
 
-        if current_cap == new_cap and renderer is None:
+        if current_cap == new_cap and not profiles and not runtime_profile and renderer is None:
             print(f"Antigravity settings already applied (cap: {new_cap:,}; stats: {'on' if stats_enabled else 'off'}).")
             return
 
@@ -314,6 +369,9 @@ def apply_settings(configured_cap, stats_enabled):
             for offset in offsets:
                 staged.seek(offset)
                 staged.write(immediate)
+            for offset, limit in profiles + runtime_profile:
+                staged.seek(offset)
+                staged.write(limit)
             if renderer is not None:
                 offset, archive = renderer
                 staged.seek(offset)
@@ -321,6 +379,10 @@ def apply_settings(configured_cap, stats_enabled):
             staged.flush()
             if read_clamp(staged) != (offsets, new_cap):
                 raise ValueError("staged binary has the wrong clamp location or cap")
+            for offset, limit in profiles + runtime_profile:
+                staged.seek(offset)
+                if staged.read(len(limit)) != limit:
+                    raise ValueError("staged binary has the wrong model-profile limit")
 
             staged_stat = os.fstat(staged.fileno())
             owner = (source_stat.st_uid, source_stat.st_gid)
@@ -330,6 +392,10 @@ def apply_settings(configured_cap, stats_enabled):
 
     if current_cap != new_cap:
         print(f"Antigravity context cap changed from {current_cap:,} to {new_cap:,} tokens.")
+    if profiles:
+        print(f"{'Restored' if configured_cap is None else 'Updated'} {len(profiles)} bundled 512K model-profile overrides.")
+    if runtime_profile:
+        print(f"{'Restored' if configured_cap is None else 'Updated'} the runtime 512K checkpoint limit.")
     if renderer is not None:
         print(f"Antigravity context stats {'enabled' if stats_enabled else 'disabled'}.")
     print("Restart Antigravity to load the changes.")

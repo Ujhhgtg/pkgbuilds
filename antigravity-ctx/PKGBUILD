@@ -1,6 +1,6 @@
 pkgname=antigravity-ctx
 pkgver=0.2.0
-pkgrel=4
+pkgrel=7
 pkgdesc='Configurable context cap and composer usage meter for Antigravity Desktop'
 arch=('x86_64')
 url='https://github.com/Ujhhgtg/pkgbuilds/tree/master/antigravity-ctx'
@@ -8,10 +8,10 @@ license=('MIT')
 depends=('antigravity' 'python')
 backup=('etc/antigravity-ctx.conf')
 source=('antigravity-ctx' 'antigravity-ctx.conf' 'antigravity-ctx.hook' 'README.md' 'stats.js' 'LICENSE')
-sha256sums=('ec8f598537371ac382513f2255c632d2412080087596f9b93312a0864cf6055d'
+sha256sums=('70851d4a1003f13fd2f7f8618b51036f15168e3c2b10074b238e1a56d29a4578'
             'b6a4bc550f3c617a43d2bc838bc1efb66872560f55a8080db48b7ea3350e3b1d'
             '1f7305666baa144ba3f8e406db2581e23fc369df4d0e989dc7c4cba8b3c9227d'
-            'dff1c48a043969c8bbdf4ffe2322cc6517bdef4c5d824c45768690af55387af9'
+            '8884b0fcec2f374cd5e73a9337d5faeddd20346bce4ed1996fa51da779ce8acf'
             '98ec3c274467618cee1217f319d04e50324f4b404fdef9283d5a447a1f41b92e'
             'b7962200bd4cf6f593e38a58bc0f730804e7cf632875f64ae1344e75cc0e4ca3')
 

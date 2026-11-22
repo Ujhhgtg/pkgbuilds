@@ -16,15 +16,19 @@ see estimated token usage and the active conversation's effective limit. It
 appears once the conversation has stats and does not change the cap.
 
 `stats off` removes the meter and restores the original renderer JavaScript.
-`cap off` restores the stock 256,000-token cap on a supported build. Run both
+`cap off` restores the stock 256,000-token default and bundled 512K profile
+overrides on a supported build. Run both commands
 before uninstalling the helper. To apply a manual config edit, run
-`pkexec /usr/bin/antigravity-ctx apply`. Relaunch Antigravity to load changes.
+`sudo /usr/bin/antigravity-ctx apply`. Relaunch Antigravity to load changes.
 
 The patch looks for a unique instruction sequence in the executable sections of
-the Linux x86-64 server. The sequence was verified on Antigravity Desktop 2.32.1
-and 2.33.0 and can match other builds that retain it. If it changes or matches
+the Linux x86-64 server. The sequence was verified on Antigravity Desktop 2.32.1,
+2.33.0, and 2.34.0 and can match other builds that retain it. If it changes or matches
 more than once, the hook skips the binary and retains the configured cap. The
-selected model's token budget and output reserve can lower the effective cap.
+bundled 512K checkpoint profile limits also follow `cap` when it is enabled.
+On 2.33.0 and 2.34.0, the patch also replaces a 512K limit supplied by a later runtime
+configuration merge. Other profile limits are unchanged, and the model's token
+budget and output reserve can still lower the effective cap.
 The optional meter finds the composer by property names and captures minified
-identifiers from the renderer. It was verified on 2.32.1 and 2.33.0. If enabled
+identifiers from the renderer. It was verified on 2.32.1, 2.33.0, and 2.34.0. If enabled
 and its renderer anchors do not match uniquely, no binary changes are made.
